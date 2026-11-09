@@ -46,7 +46,7 @@ hot laptop.
 
 ## Download
 
-Grab **StillWatching.exe** from [Releases](https://github.com/nyorbee/StillWatching/releases),
+Grab **StillWatching.exe** from [Releases](https://github.com/nyorbee/still_watchnig/releases),
 run it and look for the 👁️ in the system tray. No installation needed.
 
 > Windows SmartScreen may warn about an unknown publisher — the exe isn't code-signed.
@@ -96,6 +96,9 @@ build.bat
 The exe ends up in `build\StillWatching.exe` (Nuitka onefile).
 
 ## Changelog
+- **1.3.1** – split "Created by IT Guy" banner (left half → Facebook, right half → GitHub),
+  update check points to this repo, browsers: falls back to the page's own shortcut (YouTube: K)
+  when the media key doesn't pause, startup errors are shown instead of a silent exit
 
 - **1.3.0** – settings window, update check, *About…* window, dialog always centered on the
   player's monitor
@@ -122,7 +125,7 @@ zostawić pauzę, zamknąć odtwarzacz, uśpić, zahibernować albo wyłączyć 
 godziny działania (np. tylko 22:00–06:00), wybrać język polski lub angielski, a listy odtwarzaczy
 i stron edytować w oknie ustawień.
 
-Pobierz **StillWatching.exe** z [Releases](https://github.com/nyorbee/StillWatching/releases),
+Pobierz **StillWatching.exe** z [Releases](https://github.com/nyorbee/still_watchnig/releases),
 uruchom i szukaj oka 👁️ w zasobniku. Lewy klik — włącz/wyłącz, prawy klik — wszystkie opcje.
 
 | Menu | Pytanie | Ustawienia |
@@ -131,4 +134,4 @@ uruchom i szukaj oka 👁️ w zasobniku. Lewy klik — włącz/wyłącz, prawy 
 
 ---
 
-Created by **IT Guy** · [GitHub](https://github.com/nyorbee) · [Facebook](https://www.facebook.com/ajtiguy)
+Created by **IT Guy** · [GitHub](https://github.com/nyorbee/still_watchnig) · [Facebook](https://www.facebook.com/ajtiguy)

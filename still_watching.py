@@ -10,16 +10,61 @@ nothing, close the player, put the PC to sleep, hibernate or shut down.
 
 https://github.com/nyorbee
 """
+# ---- crash guard first: an error anywhere during startup (even in an import) is shown and
+# logged instead of the exe silently disappearing (there is no console window).
 import ctypes
+import faulthandler
+import os
+import sys
+import traceback
+
+_CRASH_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "StillWatching")
+
+
+def _startup_crash(exc_type, exc, tb):
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    path = os.path.join(_CRASH_DIR, "crash.log")
+    try:
+        os.makedirs(_CRASH_DIR, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"--- {__import__('datetime').datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
+    except OSError:
+        pass
+    try:
+        ctypes.windll.user32.MessageBoxW(0, f"StillWatching crashed:\n\n{text[-1500:]}\n\nLog: {path}",
+                                         "StillWatching", 0x10 | 0x1000)
+    except Exception:
+        pass
+
+
+sys.excepthook = _startup_crash
+try:  # native crashes (access violation in a DLL) -> Python traceback in crash_native.log
+    os.makedirs(_CRASH_DIR, exist_ok=True)
+    _native_log = open(os.path.join(_CRASH_DIR, "crash_native.log"), "a", encoding="utf-8")
+    faulthandler.enable(_native_log)
+except OSError:
+    pass
+
+
+
+def _boot_mark(stage):
+    """Tiny trace of how far startup got (boot.log, last 50 lines kept small by rotation in main)."""
+    try:
+        with open(os.path.join(_CRASH_DIR, "boot.log"), "a", encoding="utf-8") as f:
+            f.write(f"{__import__('time').strftime('%Y-%m-%d %H:%M:%S')} pid {os.getpid()} {stage}\n")
+    except OSError:
+        pass
+
+
+_boot_mark(f"start {sys.executable}")
+
 import ctypes.wintypes as wt
 import datetime
 import json
 import logging
-import os
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
@@ -30,9 +75,16 @@ import winsound
 from logging.handlers import RotatingFileHandler
 from tkinter import messagebox, ttk
 
-import psutil
-import pystray
-from PIL import Image, ImageDraw, ImageTk
+try:
+    import psutil
+    import pystray
+    from PIL import Image, ImageDraw, ImageGrab, ImageTk
+except ImportError as _missing:  # e.g. exe built with a Python that lacks the packages
+    ctypes.windll.user32.MessageBoxW(
+        0, f"StillWatching can't start - missing module: {_missing.name}\n\n"
+           "If you built the exe yourself, install the packages into the Python used for the build:\n"
+           "python -m pip install -r requirements.txt", "StillWatching", 0x10 | 0x1000)
+    sys.exit(1)
 
 AUDIO_IMPORT_ERROR = ""
 try:
@@ -42,10 +94,12 @@ try:
 except Exception as _e:  # pycaw/comtypes missing -> work without the sound check
     AUDIO_OK = False
     AUDIO_IMPORT_ERROR = repr(_e)
+_boot_mark(f"imports ok (sound check: {AUDIO_OK})")
 
 APP_NAME = "StillWatching"
-VERSION = "1.3.0"
-GITHUB_URL = "https://github.com/nyorbee"
+VERSION = "1.3.1"
+GITHUB_REPO = "nyorbee/still_watchnig"
+GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
 ITGUY_URL = "https://www.facebook.com/ajtiguy"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,7 +139,7 @@ DEFAULTS = {
     "active_from": "22:00",
     "active_until": "06:00",
     "check_updates": True,
-    "update_repo": "nyorbee/StillWatching",
+    "update_repo": GITHUB_REPO,
     "last_update_check": 0,
     "dev_unlocked": False,           # 5x click on "Created by IT Guy" in About
     "dev_mode": False,
@@ -104,7 +158,7 @@ DEV_POLL_S = 2
 POLL_S = 10
 PEAK_THRESHOLD = 0.0005
 DEV_UNLOCK_CLICKS = 5
-DEV_UNLOCK_WINDOW_S = 4  # max gap between clicks
+DEV_UNLOCK_WINDOW_S = 0.7  # max gap between quick clicks
 UPDATE_INTERVAL_S = 24 * 3600
 
 # ------------------------------------------------------------------- texts
@@ -141,6 +195,8 @@ TEXTS = {
         "dev_diag": "Diagnostics window",
         "dev_force": "Run full check now (ignore inactivity)",
         "dev_ask": "Show the question only",
+        "dev_shots": "Make README screenshots (EN + PL)",
+        "n_shots": "Saved {n} screenshots to {path}",
         "edit": "Edit settings file (players, sites)",
         "about": "About",
         "open_log": "Open log",
@@ -230,6 +286,8 @@ TEXTS = {
         "dev_diag": "Okno diagnostyki",
         "dev_force": "Pełne sprawdzenie teraz (pomiń bezczynność)",
         "dev_ask": "Pokaż samo pytanie",
+        "dev_shots": "Zrób screeny do README (EN + PL)",
+        "n_shots": "Zapisano {n} screenów w {path}",
         "edit": "Edytuj plik ustawień (odtwarzacze, strony)",
         "about": "O programie",
         "open_log": "Otwórz log",
@@ -336,6 +394,7 @@ WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 user32.EnumWindows.argtypes = [WNDENUMPROC, wt.LPARAM]
 
 VK_SPACE = 0x20
+VK_K = 0x4B  # YouTube's own play/pause shortcut (doesn't scroll or press buttons like Space can)
 VK_MEDIA_PLAY_PAUSE = 0xB3
 KEYEVENTF_EXTENDEDKEY = 0x1
 KEYEVENTF_KEYUP = 0x2
@@ -609,6 +668,9 @@ class Config:
                         self.data[k] = v
                     else:
                         log.warning("Invalid value for %s in settings: %r - using %r", k, v, self.data[k])
+            if self.data["update_repo"].lower() == "nyorbee/stillwatching":  # old wrong default
+                self.data["update_repo"] = GITHUB_REPO
+                stored.pop("update_repo", None)  # forces a save below
             # keep newly added default players (e.g. after an update) in an older list
             if "zuikaku.exe" not in [p.lower() for p in self.data["players"]]:
                 self.data["players"] = ["zuikaku.exe"] + self.data["players"]
@@ -818,6 +880,7 @@ class App:
                 Item(t("dev_diag"), lambda: self.ui_queue.put(("diag", None))),
                 Item(t("dev_force"), lambda: self.run_forced_check()),
                 Item(t("dev_ask"), lambda: self.ui_queue.put(("ask", None))),
+                Item(t("dev_shots"), lambda: self.ui_queue.put(("shots", None))),
                 Item(t("edit"), lambda: os.startfile(CONFIG_PATH)),
                 Item(t("open_log"), lambda: os.path.exists(LOG_PATH) and os.startfile(LOG_PATH)))),
             Item(lambda i: self.t("upd_download", v=self.update_info[0]) if self.update_info else "-",
@@ -1011,9 +1074,17 @@ class App:
 
     # ---- player control
     def toggle_playback(self, target, method=None):
-        """Sends Play/Pause. Returns the method actually used: "space" or "media"."""
+        """Sends Play/Pause. Returns the method actually used: "space", "media" or "page_key"."""
         method = method or ("media" if target.kind == "browser" else self.cfg["pause_method"])
-        if method == "space":
+        if method == "page_key":  # browser fallback: focus the window, press the site's own shortcut
+            hwnd = target.hwnd
+            if hwnd and not user32.IsIconic(hwnd) and force_foreground(hwnd):
+                youtube = "youtube" in target.title.lower()
+                log.debug("%s -> %s", "K" if youtube else "Space", target)
+                tap_key(VK_K if youtube else VK_SPACE)
+                return "page_key"
+            log.info("Browser window can't be focused - using the media key instead")
+        elif method == "space":
             hwnd = target.hwnd
             if hwnd and not user32.IsIconic(hwnd) and force_foreground(hwnd):
                 log.debug("Space -> %s", target)
@@ -1034,6 +1105,13 @@ class App:
             tap_key(VK_MEDIA_PLAY_PAUSE, extended=True)
             if self.safe_wait_sound(target, False, 3.0, on_error=True):
                 return "media"
+        elif target.kind == "browser":
+            # The media key goes to whichever app Windows thinks is "the" media player - sometimes
+            # another one (Spotify, PotPlayer...) or nothing. Fall back to the page's own shortcut.
+            log.info("Still playing after the media key - trying the page shortcut in the browser")
+            if self.toggle_playback(target, "page_key") == "page_key" and \
+                    self.safe_wait_sound(target, False, 3.0, on_error=True):
+                return "page_key"
         log.warning("Could not pause %s", target)
         self.notify(self.t("n_pause_fail", name=target.name), always=True)
         return None
@@ -1170,7 +1248,10 @@ class App:
                 if cmd == "quit":
                     self.root.destroy()
                     return
-                if cmd == "about":
+                if cmd == "shots":
+                    if not self.dialog_open:
+                        ScreenshotMaker(self).start()
+                elif cmd == "about":
                     if self.about_window and self.about_window.alive():
                         self.about_window.top.lift()
                         self.about_window.top.focus_force()
@@ -1226,6 +1307,21 @@ class App:
         self.icon.stop()
 
 
+def created_footer(parent, img):
+    """Black "Created by IT Guy" strip. Left half -> Facebook, right half -> GitHub."""
+    footer = tk.Label(parent, bg="black", cursor="hand2", pady=4)
+    if img:
+        footer.config(image=img)
+    else:
+        footer.config(text="Created by IT Guy", fg="white", font=("Consolas", 10))
+    footer.pack(fill="x")
+    return footer
+
+
+def created_half_url(event):
+    return ITGUY_URL if event.x < event.widget.winfo_width() / 2 else GITHUB_URL
+
+
 class AskDialog:
     def __init__(self, app, waiter):
         self.app, self.waiter = app, waiter
@@ -1258,13 +1354,8 @@ class AskDialog:
             tk.Label(frame, text=app.t("q_dev"), font=("Segoe UI", 8), fg="#b00").pack(pady=(10, 0))
 
         self.created_img = self._created_by_image(round(22 * top.winfo_fpixels("1i") / 96))
-        footer = tk.Label(top, bg="black", cursor="hand2", pady=4)
-        if self.created_img:
-            footer.config(image=self.created_img)
-        else:
-            footer.config(text="Created by IT Guy", fg="white", font=("Consolas", 10))
-        footer.pack(fill="x")
-        footer.bind("<Button-1>", lambda e: webbrowser.open_new_tab(ITGUY_URL))
+        footer = created_footer(top, self.created_img)
+        footer.bind("<Button-1>", lambda e: webbrowser.open_new_tab(created_half_url(e)))
 
         top.bind("<Return>", lambda e: self.finish(True))
         top.bind("<Escape>", lambda e: self.finish(True))
@@ -1321,6 +1412,95 @@ class AskDialog:
             done.set()
 
 
+def window_bounds(hwnd):
+    """Visible bounds of a window (without the invisible Win10/11 resize border)."""
+    r = wt.RECT()
+    try:
+        dwm = ctypes.WinDLL("dwmapi")
+        if dwm.DwmGetWindowAttribute(wt.HWND(hwnd), 9, ctypes.byref(r), ctypes.sizeof(r)) == 0:
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return r.left, r.top, r.right, r.bottom
+
+
+def project_dir():
+    """Folder of the .exe (compiled) or of the script - not the onefile temp folder."""
+    compiled = globals().get("__compiled__")
+    if compiled is not None:
+        return os.path.dirname(os.path.abspath(getattr(compiled, "original_argv0", None) or sys.argv[0]))
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+class ScreenshotMaker:
+    """Opens each window in English and Polish, grabs it and saves PNGs for the README."""
+
+    def __init__(self, app):
+        self.app = app
+        self.out = os.path.join(project_dir(), "docs", "screenshots")
+        self.saved = 0
+        self.steps = [(lang, kind) for lang in ("en", "pl")
+                      for kind in ("ask", "about", "settings_general", "settings_players")]
+        with app.cfg.lock:  # temporary, not saved: language + no [DEV] note in the dialog
+            self.orig = (app.cfg.data["language"], app.cfg.data["dev_mode"])
+            app.cfg.data["dev_mode"] = False
+
+    def start(self):
+        os.makedirs(self.out, exist_ok=True)
+        self.app.dialog_open = True  # keep the monitor quiet meanwhile
+        self.next()
+
+    def next(self):
+        if not self.steps:
+            return self.done()
+        lang, kind = self.steps.pop(0)
+        self.app.dialog_open = True
+        with self.app.cfg.lock:
+            self.app.cfg.data["language"] = lang
+        try:
+            if kind == "ask":
+                win = AskDialog(self.app, None)
+                self.app.dialog_open = True
+                top, close = win.top, lambda: win.finish(True)
+            elif kind == "about":
+                win = AboutWindow(self.app)
+                top, close = win.top, win.top.destroy
+            else:
+                win = SettingsWindow(self.app)
+                if kind == "settings_players":
+                    win.nb.select(1)
+                top, close = win.top, win.top.destroy
+            top.attributes("-topmost", True)
+            top.after(900, lambda: self.grab(top, f"{kind}_{lang}.png", close))
+        except Exception:
+            log.exception("Screenshot %s/%s failed", kind, lang)
+            self.app.root.after(100, self.next)
+
+    def grab(self, top, name, close):
+        try:
+            top.update()
+            box = window_bounds(int(top.wm_frame(), 16))
+            ImageGrab.grab(bbox=box, all_screens=True).save(os.path.join(self.out, name))
+            self.saved += 1
+        except Exception:
+            log.exception("Could not grab %s", name)
+        close()
+        self.app.root.after(300, self.next)
+
+    def done(self):
+        with self.app.cfg.lock:
+            self.app.cfg.data["language"], self.app.cfg.data["dev_mode"] = self.orig
+        self.app.dialog_open = False
+        self.app.notify(self.app.t("n_shots", n=self.saved, path=self.out), always=True)
+        try:
+            os.startfile(self.out)
+        except OSError:
+            pass
+
+
 class AboutWindow:
     def __init__(self, app):
         self.app = app
@@ -1374,12 +1554,7 @@ class AboutWindow:
 
         # "Created by IT Guy" strip - 5 quick clicks = developer menu on/off
         self.created_img = AskDialog._created_by_image(round(22 * scale))
-        footer = tk.Label(top, bg="black", pady=4)
-        if self.created_img:
-            footer.config(image=self.created_img)
-        else:
-            footer.config(text="Created by IT Guy", fg="white", font=("Consolas", 10))
-        footer.pack(fill="x")
+        footer = created_footer(top, self.created_img)
         footer.bind("<Button-1>", self.on_created)
 
         top.bind("<Escape>", lambda e: top.destroy())
@@ -1387,6 +1562,7 @@ class AboutWindow:
         top.attributes("-alpha", 1.0)
         top.focus_force()
         self._clear_job = None
+        self._link_job = None
 
     def alive(self):
         try:
@@ -1394,8 +1570,17 @@ class AboutWindow:
         except tk.TclError:
             return False
 
-    def on_created(self, event=None):
+    def on_created(self, event):
+        """One click opens the link (Facebook / GitHub half). Quick clicks in a row don't open
+        anything - 5 of them show/hide the developer menu."""
+        url = created_half_url(event)
+        if self._link_job:
+            self.top.after_cancel(self._link_job)
+            self._link_job = None
         msg = self.app.created_by_clicked()
+        if len(self.app._created_clicks) == 1:  # first click of a burst: open unless more follow
+            delay = int(DEV_UNLOCK_WINDOW_S * 1000)
+            self._link_job = self.top.after(delay, lambda: webbrowser.open_new_tab(url))
         self.status.config(text=msg)
         if self._clear_job:
             self.top.after_cancel(self._clear_job)
@@ -1470,7 +1655,7 @@ class SettingsWindow:
             top.iconbitmap(os.path.join(BASE_DIR, "eye.ico"))
         except tk.TclError:
             pass
-        nb = ttk.Notebook(top)
+        nb = self.nb = ttk.Notebook(top)
         nb.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
         gen = ttk.Frame(nb, padding=12)
@@ -1695,8 +1880,16 @@ def setup_logging():
 
 
 def main():
+    _boot_mark("main")
+    try:  # keep boot.log small
+        bp = os.path.join(_CRASH_DIR, "boot.log")
+        if os.path.getsize(bp) > 20_000:
+            os.replace(bp, bp + ".old")
+    except OSError:
+        pass
     mutex = single_instance()
     if mutex is None:
+        _boot_mark("already running - exit")
         cfg_lang = "en"
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -1715,5 +1908,23 @@ def main():
     log.info("Exited")
 
 
+def fatal(exc_text):
+    """Last resort: write crash.log and show it, instead of silently disappearing."""
+    path = os.path.join(DATA_DIR, "crash.log")
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S} v{VERSION}\n{exc_text}\n")
+    except OSError:
+        pass
+    user32.MessageBoxW(0, f"StillWatching crashed:\n\n{exc_text[-1500:]}\n\nLog: {path}",
+                       APP_NAME, 0x10 | 0x1000)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        fatal(traceback.format_exc())
